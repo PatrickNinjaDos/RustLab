@@ -1,28 +1,15 @@
 use anyhow::Context;
-use futures_util::{SinkExt, StreamExt, stream};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use std::collections::HashMap;
+use std::collections::VecDeque; // coada pentru BFS — echivalentul unui queue din C
 
 pub const PROTOCOL_VERSION: i32 = 1;
 
-// ─────────────────────────────────────────────
-// Structuri de protocol (neschimbate față de original)
-// ─────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Envelope {
-    pub command: String,
-    #[serde(default)]
-    pub args: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Player {
-    pub id: i32,
-    pub name: String,
-    pub heroes: Vec<PlayerHeroSpawn>,
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// STRUCTURI DE DATE
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerHeroSpawn {
@@ -31,6 +18,13 @@ pub struct PlayerHeroSpawn {
     pub y: i32,
     #[serde(rename = "type")]
     pub type_: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Player {
+    pub id: i32,
+    pub name: String,
+    pub heroes: Vec<PlayerHeroSpawn>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,18 +60,6 @@ pub struct Hero {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Projectile {
-    pub owner_id: i32,
-    #[serde(rename = "type")]
-    pub type_: String,
-    pub origin_x: i32,
-    pub origin_y: i32,
-    pub x: i32,
-    pub y: i32,
-    pub ttl: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Wall {
     pub x: i32,
     pub y: i32,
@@ -86,16 +68,15 @@ pub struct Wall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameState {
     pub heroes: Vec<Hero>,
-    pub projectiles: Vec<Projectile>,
     pub walls: Vec<Wall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartMatchArgs {
-    pub config: GameConfig,
-    pub state: GameState,
     pub match_id: String,
     pub your_player_id: i32,
+    pub config: GameConfig,
+    pub state: GameState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,137 +92,161 @@ pub struct EndMatchArgs {
     pub winner: Option<String>,
 }
 
-// ─────────────────────────────────────────────
-// Mesaj WebSocket generic
-// ─────────────────────────────────────────────
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WsMsg {
     pub command: String,
     pub args: serde_json::Value,
 }
 
-/// Trimite un singur mesaj (LOGIN, PRACTICE, etc.)
-async fn send_one<S>(write: &mut S, command: &str, args: serde_json::Value) -> anyhow::Result<()>
+// ─────────────────────────────────────────────────────────────────────────────
+// TRIMITERE MESAJE
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn send_msg<S>(write: &mut S, command: &str, args: serde_json::Value) -> anyhow::Result<()>
 where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    let text = serde_json::to_string(&serde_json::json!({ "command": command, "args": args }))
-        .context("serialize")?;
-    write.send(Message::Text(text.into())).await.context("send")?;
+    let json = serde_json::json!({ "command": command, "args": args });
+    let text = serde_json::to_string(&json).context("eroare serializare JSON")?;
+    println!("  [TRIMIS] {}", text);
+    write.send(Message::Text(text.into())).await.context("eroare trimitere mesaj")?;
     Ok(())
 }
 
-/// Trimite toate comenzile dintr-o tură într-un singur batch — ~2x mai rapid.
-async fn send_all_commands<S>(
-    write: &mut S,
-    commands: Vec<(&str, serde_json::Value)>,
-) -> anyhow::Result<()>
-where
-    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
-    let messages: Vec<Result<Message, tokio_tungstenite::tungstenite::Error>> = commands
-        .into_iter()
-        .map(|(cmd, args)| {
-            let text = serde_json::to_string(&serde_json::json!({ "command": cmd, "args": args }))
-                .expect("serialize command");
-            Ok(Message::Text(text.into()))
-        })
-        .collect();
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
 
-    write
-        .send_all(&mut stream::iter(messages))
-        .await
-        .context("send_all")?;
-    Ok(())
+// verificare sa fie in harta
+fn in_bounds(x: i32, y: i32, map_w: i32, map_h: i32) -> bool {
+    x >= 1 && y >= 1 && x < map_w - 1 && y < map_h - 1
 }
 
-// ─────────────────────────────────────────────
-// Starea curentă a meciului (ținută în memorie)
-// ─────────────────────────────────────────────
-
-struct MatchState {
-    config: GameConfig,
-    my_player_id: i32,
-}
-
-// ─────────────────────────────────────────────
-// LOGICA DE JOC
-// ─────────────────────────────────────────────
-
-/// Returnează semnul unui număr (-1, 0 sau 1)
-fn sign(v: i32) -> i32 {
-    v.cmp(&0) as i32
-}
-
-/// Verifică dacă o poziție de centru (cx, cy) se suprapune cu un zid
+// verficare coliziune
 fn overlaps_wall(cx: i32, cy: i32, walls: &[Wall]) -> bool {
-    for w in walls {
-        // Ambele sunt centre de blocuri 3x3; se suprapun dacă distanța < 3 pe oricare axă
-        if (cx - w.x).abs() < 3 && (cy - w.y).abs() < 3 {
-            return true;
-        }
-    }
-    false
+    walls.iter().any(|w| (cx - w.x).abs() < 3 && (cy - w.y).abs() < 3)
 }
 
-/// Calculează cel mai bun move pentru un erou față de o țintă
-/// Întoarce coordonatele noi ale centrului
-fn best_move(
-    hero: &Hero,
-    target_x: i32,
-    target_y: i32,
-    walls: &[Wall],
-    map_w: i32,
-    map_h: i32,
-) -> (i32, i32) {
-    let sx = sign(target_x - hero.x);
-    let sy = sign(target_y - hero.y);
+// Snap: găsește cel mai aproape centru valid pe grila 3x3 față de (x, y).
+// Centrele valide sunt pozițiile unde x % 3 == 1 și y % 3 == 1.
+// Folosit ca să ne asigurăm că ținta e pe o poziție pe care un erou poate sta.
+fn snap_to_grid(x: i32, y: i32) -> (i32, i32) {
+    // Calculăm cel mai aproape număr cu rest 1 la împărțirea cu 3
+    let snap = |v: i32| -> i32 {
+        let r = v % 3;
+        // r poate fi 0, 1, 2 (sau negativ în Rust, dar coordonatele noastre sunt pozitive)
+        if r == 1 { v }        // deja pe grid
+        else if r == 0 { v + 1 } // rotunjim în sus
+        else { v - 1 }           // r == 2, rotunjim în jos
+    };
+    (snap(x), snap(y))
+}
 
-    // Direcțiile de încercat, în ordinea preferinței:
-    // 1. diagonala ideală, 2. doar x, 3. doar y, 4. stai pe loc
-    let candidates = [
-        (sx, sy),
-        (sx, 0),
-        (0, sy),
-        (0, 0), // no-op
+fn bfs_next_step(
+    start_x: i32, start_y: i32,   
+    target_x: i32, target_y: i32, 
+    walls: &[Wall],
+    map_w: i32, map_h: i32,
+) -> (i32, i32) {
+
+    //snap
+    let (target_x, target_y) = snap_to_grid(target_x, target_y);
+
+    //finish
+    if start_x == target_x && start_y == target_y {
+        println!("    [BFS] deja la țintă ({},{})", start_x, start_y);
+        return (start_x, start_y);
+    }
+
+    // HashMap (cheie = poziție, valoare = poziția din care am venit).
+    let mut came_from: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
+
+    // push_back = enqueue, pop_front = dequeue
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+
+    came_from.insert((start_x, start_y), (start_x, start_y));
+    queue.push_back((start_x, start_y)); 
+
+    let directions: [(i32, i32); 8] = [
+        ( 0,  3), // sus
+        ( 0, -3), // jos
+        ( 3,  0), // dreapta
+        (-3,  0), // stânga
+        ( 3,  3), // diagonal dreapta-sus
+        ( 3, -3), // diagonal dreapta-jos
+        (-3,  3), // diagonal stânga-sus
+        (-3, -3), // diagonal stânga-jos
     ];
 
-    for (dx, dy) in candidates {
-        if dx == 0 && dy == 0 {
-            return (hero.x, hero.y); // no-op intenționat
+    while let Some((cx, cy)) = queue.pop_front() { 
+
+        if cx == target_x && cy == target_y {
+            // Urmăm came_from înapoi până ajungem la nodul al cărui tată e startul.
+            // Acela e primul pas pe care trebuie să îl facem.
+            let mut current = (cx, cy);
+            loop {
+                let parent = came_from[&current]; // de unde am venit în current
+                if parent == (start_x, start_y) {
+                    // current e primul pas după start — asta trimitem
+                    println!("    [BFS] primul pas: ({},{}) → ({},{})",
+                        start_x, start_y, current.0, current.1);
+                    return current;
+                }
+                current = parent; // mergem un pas înapoi spre start
+            }
         }
-        let nx = hero.x + 3 * dx;
-        let ny = hero.y + 3 * dy;
-        // Verifică limite hartă (centrul trebuie să fie la cel puțin 1 tile de margine)
-        if nx < 1 || ny < 1 || nx >= map_w - 1 || ny >= map_h - 1 {
-            continue;
-        }
-        if !overlaps_wall(nx, ny, walls) {
-            return (nx, ny);
+
+        for (dx, dy) in directions {
+            let nx = cx + dx; // coordonata X a vecinului
+            let ny = cy + dy; // coordonata Y a vecinului
+
+            // Verificăm dacă vecinul e valid
+            let valid = in_bounds(nx, ny, map_w, map_h) // e în hartă?
+                && !overlaps_wall(nx, ny, walls)         // nu e zid?
+                && !came_from.contains_key(&(nx, ny));   // nu l-am vizitat deja?
+
+            if valid {
+                came_from.insert((nx, ny), (cx, cy)); // marcăm de unde am venit
+                queue.push_back((nx, ny));            // îl adăugăm în coadă
+            }
         }
     }
 
-    (hero.x, hero.y) // nu am putut muta, stăm pe loc
+    (start_x, start_y)
 }
 
-///calculul distantei cu chebysev
-fn chebyshev(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
-    (ax - bx).abs().max((ay - by).abs())
+// ─────────────────────────────────────────────────────────────────────────────
+// BRESENHAM 
+// ─────────────────────────────────────────────────────────────────────────────
+ 
+fn bresenham_line(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
+    let mut points = Vec::new();
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let (mut x, mut y) = (x0, y0);
+    loop {
+        points.push((x, y));
+        if x == x1 && y == y1 { break; }
+        let e2 = 2 * err;
+        if e2 >= dy { err += dy; x += sx; }
+        if e2 <= dx { err += dx; y += sy; }
+    }
+    points
 }
 
-//verificare daca are linie libera
-fn has_clear_line(from_x: i32, from_y: i32, to_x: i32, to_y: i32, walls: &[Wall]) -> bool {
-    let mut x = from_x;
-    let mut y = from_y;
-    let dx = sign(to_x - from_x);
-    let dy = sign(to_y - from_y);
-    let steps = chebyshev(from_x, from_y, to_x, to_y);
-    for _ in 0..steps {
-        x += dx;
-        y += dy;
+// ─────────────────────────────────────────────────────────────────────────────
+// LINE OF SIGHT
+// ─────────────────────────────────────────────────────────────────────────────
+ 
+// Returnează true dacă linia de la (x0,y0) la (x1,y1) nu e blocată de ziduri.
+fn has_line_of_sight(x0: i32, y0: i32, x1: i32, y1: i32, walls: &[Wall]) -> bool {
+    let line = bresenham_line(x0, y0, x1, y1);
+    for (px, py) in line {
         for w in walls {
-            if (x - w.x).abs() <= 1 && (y - w.y).abs() <= 1 {
+            if (px - w.x).abs() <= 1 && (py - w.y).abs() <= 1 {
                 return false;
             }
         }
@@ -249,256 +254,281 @@ fn has_clear_line(from_x: i32, from_y: i32, to_x: i32, to_y: i32, walls: &[Wall]
     true
 }
 
-//functie pentru a ne feri
-fn escape_direction(hero: &Hero, projectiles: &[Projectile], my_player_id: i32) -> Option<(i32, i32)> {
-    for p in projectiles {
-        if p.owner_id == my_player_id { continue; }
-        let dx = sign(p.x - p.origin_x);
-        let dy = sign(p.y - p.origin_y);
-        // Glonțul vine spre noi dacă e pe aceeași traiectorie și se apropie
-        let on_path = sign(hero.x - p.x) == dx && sign(hero.y - p.y) == dy;
-        let close = chebyshev(p.x, p.y, hero.x, hero.y) < 12;
-        if on_path && close {
-            // Fugi perpendicular: dacă glonțul merge pe Y → fugi pe X, și invers
-            let ex = hero.x + if dy != 0 { 3 } else { 0 };
-            let ey = hero.y + if dx != 0 { 3 } else { 0 };
-            return Some((ex, ey));
+// ─────────────────────────────────────────────────────────────────────────────
+// PROCESAREA TUREI
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Gaseste prima pozitie libera de ziduri mergand de la fundul hartii in sus.
+// Folosita ca target pentru eroi cand inamicul e in partea de jos.
+fn find_bottom_target(spawn_x: i32, map_h: i32, walls: &[Wall], map_w: i32) -> (i32, i32) {
+    let mut y = map_h - 2;
+    while y >= 1 {
+        let (sx, sy) = snap_to_grid(spawn_x, y);
+        if in_bounds(sx, sy, map_w, map_h) && !overlaps_wall(sx, sy, walls) {
+            return (sx, sy);
         }
+        y -= 3;
     }
-    None
+    snap_to_grid(spawn_x, map_h / 2)
 }
 
-/// Procesează o tură: calculează toate acțiunile și le trimite într-un singur batch.
+// Gaseste prima pozitie libera de ziduri mergand de la varful hartii in jos.
+fn find_top_target(spawn_x: i32, map_h: i32, walls: &[Wall], map_w: i32) -> (i32, i32) {
+    let mut y = 1;
+    while y < map_h - 1 {
+        let (sx, sy) = snap_to_grid(spawn_x, y);
+        if in_bounds(sx, sy, map_w, map_h) && !overlaps_wall(sx, sy, walls) {
+            return (sx, sy);
+        }
+        y += 3;
+    }
+    snap_to_grid(spawn_x, map_h / 2)
+}
+
 async fn process_turn<S>(
     write: &mut S,
-    ms: &MatchState,
+    my_player_id: i32,
+    config: &GameConfig,
+    map_walls: &[Wall],   
+    enemy_spotted: &mut bool,
+    target_x: &mut i32,
+    target_y: &mut i32,
+    home_x: i32,
+    home_y: i32,
+    away_x: i32,
+    away_y: i32,
     turn_args: &StartTurnArgs,
 ) -> anyhow::Result<()>
 where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let state = &turn_args.state;
-    let turn = turn_args.turn;
+    let map_w = config.width;
+    let map_h = config.height;
 
-    let my_heroes: Vec<&Hero> = state.heroes.iter().filter(|h| h.owner_id == ms.my_player_id).collect();
-    let enemy_heroes: Vec<&Hero> = state.heroes.iter().filter(|h| h.owner_id != ms.my_player_id).collect();
+    let my_heroes: Vec<&Hero> = state.heroes.iter()
+        .filter(|h| h.owner_id == my_player_id)
+        .collect();
 
-    println!("=== Tura {} | eroii mei: {} | inamici vizibili: {} ===",
-        turn, my_heroes.len(), enemy_heroes.len());
+    let enemy_heroes: Vec<&Hero> = state.heroes.iter()
+        .filter(|h| h.owner_id != my_player_id)
+        .collect();
 
-    // construim lista de comenzi fără să trimitem nimic încă
-    let mut commands: Vec<(&str, serde_json::Value)> = Vec::new();
-
-    for (hero_index, hero) in my_heroes.iter().enumerate() {
-        println!(
-            "  Eroul {} la ({},{}) hp={} cooldown={}",
-            hero.id, hero.x, hero.y, hero.hp, hero.cooldown
-        );
-
-        // ne ferim prioritate maxima
-        if let Some((ex, ey)) = escape_direction(hero, &state.projectiles, ms.my_player_id) {
-            println!("    → EVIT proiectil, MOVE ({ex},{ey})");
-            commands.push(("MOVE", serde_json::json!({ "hero_id": hero.id, "x": ex, "y": ey })));
-                continue;
-        }
-
-        // daca nu vedem inamicii ne apropiem de centru
-        if enemy_heroes.is_empty() {
-            let cx = ms.config.width / 2;
-            let cy = ms.config.height / 2;
-            let cx = cx - ((cx - 1) % 3);
-            let cy = cy - ((cy - 1) % 3);
-            let (nx, ny) = best_move(hero, cx, cy, &state.walls, ms.config.width, ms.config.height);
-            println!("    → MOVE spre centru ({nx},{ny})");
-            commands.push(("MOVE", serde_json::json!({ "hero_id": hero.id, "x": nx, "y": ny })));
-            continue;
-        }
-         
-        let assigned_target = enemy_heroes[hero_index % enemy_heroes.len()];
-        let dist = chebyshev(hero.x, hero.y, assigned_target.x, assigned_target.y);
-
-        if hero.cooldown == 0 
-        {
-            //daca poate trage
-            if has_clear_line(hero.x, hero.y, assigned_target.x, assigned_target.y, &state.walls) {
-            println!("    → SHOOT spre ({},{}) dist={}", assigned_target.x, assigned_target.y, dist);
-                commands.push(("SHOOT", serde_json::json!({
-                    "hero_id": hero.id,
-                    "x": assigned_target.x,
-                    "y": assigned_target.y
-                })));
-            }
-            else {
-                // nu putem trage ne apropiem de inamic
-                let (nx, ny) = best_move(hero, assigned_target.x, assigned_target.y, &state.walls, ms.config.width, ms.config.height);
-                commands.push(("MOVE", serde_json::json!({ "hero_id": hero.id, "x": nx, "y": ny })));
-            }
-        } else {
-    const IDEAL_DIST: i32 = 12;
-    let (nx, ny) = if dist > IDEAL_DIST + 3 {
-        // prea depare ne apropiem
-        best_move(hero, assigned_target.x, assigned_target.y, &state.walls, ms.config.width, ms.config.height)
-    } else if dist < IDEAL_DIST - 3 {
-        // prea aproape ne depărtăm
-        let away_x = hero.x + 3 * sign(hero.x - assigned_target.x);
-        let away_y = hero.y + 3 * sign(hero.y - assigned_target.y);
-        (away_x, away_y)
-    } else {
-        (hero.x, hero.y) // distanta buna
-    };
-    commands.push(("MOVE", serde_json::json!({ "hero_id": hero.id, "x": nx, "y": ny })));
-}
+    if !enemy_heroes.is_empty() {
+        *enemy_spotted = true;
     }
 
-    // Trimitem toate comenzile simultan într-un singur batch
-    send_all_commands(write, commands).await?;
+    // Colectam toate mesajele turei si le trimitem odata cu send_all
+    let mut messages: Vec<Message> = Vec::new();
+
+    for hero in &my_heroes {
+
+        if hero.x == *target_x && hero.y == *target_y {
+            if *target_x == away_x && *target_y == away_y {
+                *target_x = home_x;
+                *target_y = home_y;
+            } else {
+                *target_x = away_x;
+                *target_y = away_y;
+            }
+        }
+
+        // tragem daca se poate
+        if hero.cooldown == 0 && !enemy_heroes.is_empty() {
+            let target = enemy_heroes.iter().find(|enemy| {
+                has_line_of_sight(hero.x, hero.y, enemy.x, enemy.y, map_walls)
+            });
+
+            if let Some(enemy) = target {
+                let json = serde_json::json!({
+                    "command": "SHOOT",
+                    "args": {
+                        "hero_id": hero.id,
+                        "x": enemy.x,
+                        "y": enemy.y,
+                        "comment": "🔫"
+                    }
+                });
+                messages.push(Message::Text(serde_json::to_string(&json).unwrap().into()));
+                continue;
+            }
+        }
+
+        let (move_x, move_y) = if !*enemy_spotted {
+            (hero.x, hero.y)
+        } else {
+            bfs_next_step(
+                hero.x, hero.y,
+                *target_x, *target_y,
+                map_walls,
+                map_w, map_h,
+            )
+        };
+
+        let comment = if move_x == hero.x && move_y == hero.y {
+            "😴"
+        } else {
+            "🚶"
+        };
+
+        let json = serde_json::json!({
+            "command": "MOVE",
+            "args": {
+                "hero_id": hero.id,
+                "x": move_x,
+                "y": move_y,
+                "comment": comment
+            }
+        });
+        messages.push(Message::Text(serde_json::to_string(&json).unwrap().into()));
+    }
+
+    println!("  [SEND_ALL] {} mesaje", messages.len());
+    write.send_all(&mut futures_util::stream::iter(messages).map(Ok)).await
+        .context("eroare send_all")?;
 
     Ok(())
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // MAIN
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let url = "wss://bitdefenders.cvjd.me/ws";
     println!("Conectare la {url} ...");
 
-    let (ws, _) = connect_async(url).await.context("connect")?;
+    let (ws, _) = connect_async(url).await.context("nu s-a putut conecta")?;
     let (mut write, mut read) = ws.split();
     println!("Conectat!");
 
-    // Starea meciului curent (populată la START_MATCH)
-    let mut match_state: Option<MatchState> = None;
+    let mut config: Option<GameConfig> = None;
+    let mut my_player_id: i32 = 0;
+
+    // Latch pe durata meciului: devine true când apare primul inamic vizibil (în START_TURN).
+    let mut enemy_spotted: bool = false;
+    let mut target_x: i32 = 0;
+    let mut target_y: i32 = 0;
+    let mut home_x: i32 = 0;
+    let mut home_y: i32 = 0;
+    let mut away_x: i32 = 0;
+    let mut away_y: i32 = 0;
+
+    // Zidurile complete ale hărții — salvate o singură dată la START_MATCH.
+    // La fiecare tură folosim acestea pentru BFS, nu state.walls (care e cu fog).
+    let mut map_walls: Vec<Wall> = Vec::new();
 
     while let Some(msg) = read.next().await {
         let msg = match msg {
             Ok(m) => m,
-            Err(e) => {
-                println!("Eroare WebSocket: {e:?}");
-                break;
-            }
+            Err(e) => { println!("Eroare WebSocket: {e:?}"); break; }
         };
 
-        // Gestionăm Ping/Pong/Binary/Close la nivel de transport
         let text = match msg {
             Message::Text(t) => t,
-            Message::Ping(payload) => {
-                write.send(Message::Pong(payload)).await?;
-                continue;
-            }
-            Message::Pong(_) => continue,
-            Message::Binary(_) => {
-                println!("Mesaj binar ignorat");
-                continue;
-            }
-            Message::Close(frame) => {
-                println!("Conexiune închisă: {frame:?}");
-                break;
-            }
-            Message::Frame(_) => continue,
+            Message::Ping(payload) => { write.send(Message::Pong(payload)).await?; continue; }
+            Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => continue,
+            Message::Close(frame) => { println!("Conexiune închisă: {frame:?}"); break; }
         };
 
-        // Parsăm mesajul generic
         let msg: WsMsg = match serde_json::from_str(&text) {
             Ok(m) => m,
-            Err(e) => {
-                println!("Nu am putut parsa mesajul: {e}\nRaw: {text}");
-                continue;
-            }
+            Err(e) => { println!("Parse error: {e}\nRaw: {text}"); continue; }
         };
 
-        println!("[server] command={}", msg.command);
+        println!("[SERVER] → {}", msg.command);
 
         match msg.command.as_str() {
-            // ── 1. Serverul se prezintă ──────────────────────────────────────
             "HELLO" => {
-                println!("Server version: {}", msg.args["version"]);
-                send_one(
-                    &mut write,
-                    "LOGIN",
-                    serde_json::json!({
-                        "name": "Portan-Patrick-bot",
-                        "version": PROTOCOL_VERSION
-                    }),
-                )
-                .await?;
-                println!("LOGIN trimis");
+                send_msg(&mut write, "LOGIN", serde_json::json!({
+                    "name": "Portan-Patrick-bot",
+                    "version": PROTOCOL_VERSION
+                })).await?;
             }
-
-            // ── 2. Login acceptat ────────────────────────────────────────────
             "READY" => {
-                println!("Suntem READY, pornim un meci de practică...");
-                send_one(&mut write, "PRACTICE", serde_json::json!({})).await?;
+                send_msg(&mut write, "PRACTICE", serde_json::json!({})).await?;
             }
-
-            // ── 3. Meciul începe ─────────────────────────────────────────────
             "START_MATCH" => {
-                let args: StartMatchArgs =
-                    serde_json::from_value(msg.args).context("parse START_MATCH")?;
-                println!(
-                    "Meci pornit! ID={} player_id={} harta={}x{}",
-                    args.match_id,
-                    args.your_player_id,
-                    args.config.width,
-                    args.config.height
-                );
-                println!("Eroi proprii la start:");
-                for p in &args.config.players {
-                    if p.id == args.your_player_id {
-                        for h in &p.heroes {
-                            println!("  Eroul {} tip={} la ({},{})", h.id, h.type_, h.x, h.y);
-                        }
-                    }
-                }
-                match_state = Some(MatchState {
-                    my_player_id: args.your_player_id,
-                    config: args.config,
-                });
+                let args: StartMatchArgs = serde_json::from_value(msg.args)
+                    .context("eroare la parsarea START_MATCH")?;
+
+                println!("Meci pornit! ID={} player_id={} hartă={}x{}",
+                    args.match_id, args.your_player_id,
+                    args.config.width, args.config.height);
+
+                // Salvăm zidurile hărții complete — le folosim pentru tot meciul
+                println!("  ziduri pe hartă: {}", args.state.walls.len());
+                map_walls = args.state.walls; // <-- salvăm harta completă aici
+
+                my_player_id = args.your_player_id;
+
+                // Calculam home si away din spawn-urile eroilor
+                let map_w = args.config.width;
+                let map_h = args.config.height;
+                let my_spawn_x = args.config.players.iter()
+                    .find(|p| p.id == my_player_id)
+                    .and_then(|p| p.heroes.first())
+                    .map(|h| h.x)
+                    .unwrap_or(map_w / 2);
+                let enemy_spawn_x = args.config.players.iter()
+                    .find(|p| p.id != my_player_id)
+                    .and_then(|p| p.heroes.first())
+                    .map(|h| h.x)
+                    .unwrap_or(map_w / 2);
+                // home = cea mai apropiata pozitie libera de la varful hartii
+                // away = cea mai apropiata pozitie libera de la fundul hartii
+                let (hx, hy) = find_top_target(my_spawn_x, map_h, &map_walls, map_w);
+                let (ax, ay) = find_bottom_target(enemy_spawn_x, map_h, &map_walls, map_w);
+                home_x = hx; home_y = hy;
+                away_x = ax; away_y = ay;
+                target_x = away_x;
+                target_y = away_y;
+                println!("  [INIT] home=({},{}) away=({},{})", home_x, home_y, away_x, away_y);
+
+                config = Some(args.config);
+
+                // Reset latch-ul la inceput de meci.
+                enemy_spotted = false;
             }
-
-            // ── 4. Fiecare tură ──────────────────────────────────────────────
             "START_TURN" => {
-                let args: StartTurnArgs =
-                    serde_json::from_value(msg.args).context("parse START_TURN")?;
+                let args: StartTurnArgs = serde_json::from_value(msg.args)
+                    .context("eroare la parsarea START_TURN")?;
 
-                if let Some(ms) = &match_state {
-                    if let Err(e) = process_turn(&mut write, ms, &args).await {
+                if let Some(cfg) = &config {
+                    if let Err(e) = process_turn(
+                        &mut write,
+                        my_player_id,
+                        cfg,
+                        &map_walls,
+                        &mut enemy_spotted,
+                        &mut target_x,
+                        &mut target_y,
+                        home_x,
+                        home_y,
+                        away_x,
+                        away_y,
+                        &args,
+                    ).await {
                         println!("Eroare în process_turn: {e}");
                     }
-                } else {
-                    println!("WARN: START_TURN primit fără match_state!");
                 }
             }
-
-            // ── 5. Meciul s-a terminat ───────────────────────────────────────
             "END_MATCH" => {
-                let args: EndMatchArgs =
-                    serde_json::from_value(msg.args).context("parse END_MATCH")?;
+                let args: EndMatchArgs = serde_json::from_value(msg.args)
+                    .context("eroare la parsarea END_MATCH")?;
                 match &args.winner {
-                    Some(w) => println!("Meciul s-a terminat! Câștigător: {w} (motiv: {})", args.reason),
-                    None => println!("Meciul s-a terminat cu rezultat egal! (motiv: {})", args.reason),
+                    Some(w) => println!("Câștigător: {w} (motiv: {})", args.reason),
+                    None    => println!("Egalitate (motiv: {})", args.reason),
                 }
-                // Un singur meci per run — ieșim
                 break;
             }
-
-            // ── 6. Erori ─────────────────────────────────────────────────────
             "ERROR" => {
-                let code = &msg.args["code"];
-                let message = &msg.args["message"];
                 let fatal = msg.args["fatal"].as_bool().unwrap_or(false);
-                println!("ERROR [{code}]: {message} (fatal={fatal})");
-                if fatal {
-                    println!("Eroare fatală, ieșim.");
-                    break;
-                }
+                println!("EROARE server: {} (fatal={fatal})", msg.args["message"]);
+                if fatal { break; }
             }
-
-            other => {
-                println!("Comandă necunoscută: {other}");
-            }
+            other => println!("Comandă necunoscută: {other}"),
         }
     }
 

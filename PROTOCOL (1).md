@@ -63,10 +63,11 @@ Empty object `{}`. Client must then send `CHALLENGE` or `PRACTICE`.
 ### `CHALLENGE` (client → server)
 
 
-| Field  | Type   | Description                                                                       |
-| ------ | ------ | --------------------------------------------------------------------------------- |
-| `name` | string | Optional. If set, only match players consistent with the matchmaking rules below. |
-| `seed` | uint32 | Optional map seed. If both matched players provide seeds, they must match.        |
+| Field    | Type   | Description                                                                       |
+| -------- | ------ | --------------------------------------------------------------------------------- |
+| `name`   | string | Optional. If set, only match players consistent with the matchmaking rules below. |
+| `seed`   | uint32 | Optional map seed. If both matched players provide seeds, they must match.        |
+| `ranked` | bool   | Optional. If set to true, the match will affect Elo score.                        |
 
 
 ### `PRACTICE` (client → server)
@@ -74,9 +75,10 @@ Empty object `{}`. Client must then send `CHALLENGE` or `PRACTICE`.
 Starts a match immediately against a server-controlled bot.
 
 
-| Field  | Type   | Description                                                           |
-| ------ | ------ | --------------------------------------------------------------------- |
-| `seed` | uint32 | Optional map seed; if omitted, server generates a random 32-bit seed. |
+| Field   | Type   | Description                                                                 |
+| ------- | ------ | ----------------------------------------------------------------------------- |
+| `seed`  | uint32 | Optional map seed; if omitted, server generates a random 32-bit seed.        |
+| `my_id` | int    | Optional. `0` (default) or `1` — which player slot you take vs the practice bot (spawn side). |
 
 
 ### `START_MATCH` (server → client)
@@ -87,7 +89,7 @@ Starts a match immediately against a server-controlled bot.
 | `match_id`       | string     | UUID for persistence / replay                                                |
 | `your_player_id` | int        | `0` or `1` — which `Player.id` you are.                                      |
 | `config`         | GameConfig | Map size, limits, players (including hero spawns), `seed`, and `hero_types`. |
-| `state`          | GameState  | Full authoritative world state.                                              |
+| `state`          | GameState  | **Full** map: every wall, hero, and projectile (same payload for both players and spectators). No fog. |
 
 
 ### `START_TURN` (server → client)
@@ -102,22 +104,22 @@ Starts a match immediately against a server-controlled bot.
 ### `MOVE` (client → server, in match)
 
 
-| Field     | Type | Description                                           |
-| --------- | ---- | ----------------------------------------------------- |
-| `hero_id` | int  | Which hero you control.                               |
-| `x`,`y`   | int  | Target cell for movement intent (see movement rules). |
-
+| Field      | Type   | Description                                                                                                                                    |
+| ---------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hero_id`  | int    | Which hero you control.                                                                                                                        |
+| `x`,`y`    | int    | Target cell for movement intent (see movement rules).                                                                                          |
+| `comment`  | string | **Optional.** Short player/shout text persisted with replay and shown in UI. See **Order comments** below. |
 
 Exactly **one** `MOVE` **or** `SHOOT` per hero you own per turn. Sending two actions for the same hero is an error.
 
 ### `SHOOT` (client → server, in match)
 
 
-| Field     | Type | Description                                                        |
-| --------- | ---- | ------------------------------------------------------------------ |
-| `hero_id` | int  | Shooter.                                                           |
-| `x`,`y`   | int  | Aim point; defines trajectory via Bresenham line from hero center. |
-
+| Field      | Type   | Description                                                                        |
+| ---------- | ------ | ---------------------------------------------------------------------------------- |
+| `hero_id`  | int    | Shooter.                                                                           |
+| `x`,`y`    | int    | Aim point; defines trajectory via Bresenham line from hero center.                 |
+| `comment`  | string | **Optional.** Same as `MOVE`; see **Order comments** below.                              |
 
 ### `END_MATCH` (server → client)
 
@@ -137,6 +139,10 @@ Exactly **one** `MOVE` **or** `SHOOT` per hero you own per turn. Sending two act
 | `message` | string | Human-readable text.                          |
 | `fatal`   | bool   | If true, connection may be closed after this. |
 
+### Order comments (`comment` on `MOVE` / `SHOOT`)
+
+- **`args.comment`** is optional on both `MOVE` and `SHOOT`. It does **not** affect simulation and is purely cosmetical or for debugging
+- Can be a Unicode string of up to **36 characters**. If shorther than **16 character**, it is shown as a speech bubble in the replay viewer. Optionally, a newline `\n` character can be used to control the bubble cutoff (so you can have a 15-character bubble followed by a 20 character message shown in the sidebar)
 
 ---
 
@@ -188,6 +194,8 @@ On timeout, winner tie-break is: more alive heroes, then higher total alive HP, 
 
 ### Vision and fog (`START_TURN`)
 
+Fog applies to **`START_TURN`** (and later turns only). **`START_MATCH`** always sends the complete world state so clients can render the full map once before play.
+
 - **Vision cells**: union of all tiles with Chebyshev distance ≤ `vision_range` (default **20**) from **each** friendly hero **center**.
 - **Walls** and **Enemy heroes**: visible iff **any tile** of their **3×3 footprint** lies in the vision union
 - **Projectiles**: enemy projectiles are included if their **tile** lies in the vision union.
@@ -195,9 +203,10 @@ On timeout, winner tie-break is: more alive heroes, then higher total alive HP, 
 
 ### Matchmaking (`CHALLENGE`)
 
-- **Open challenge** (no `name`): joins a pool; matches any other open challenger, or a named challenger who named you, or you can match someone who named you while you are open.
-- **Named challenge** (`name: "Bob"`): matches only if Bob has challenged in a compatible way: Bob named you, or Bob is open and you named Bob (mutual), or symmetric named pair.
+- **Open challenge** (no `name`): joins a pool; matches any other open challenger, or a named challenger who named you
+- **Named challenge** (`name: "Bob"`): matches only if Bob has challenged in a compatible way: Bob named you, or Bob is open and you named Bob
 - **Seed compatibility**: if both players supplied `seed` in `CHALLENGE`, they are only pairable when the two seeds are equal. If one side omits `seed`, the provided seed is used.
+- **Ranked**: in addition to the above, the value of the `ranked` field must match for both challengers
 
 (Exact pairing is implemented server-side; ties resolved by FIFO.)
 
@@ -224,5 +233,4 @@ See Rust `protocol/protocol.rs` for field-for-field types. Summary:
 - **Hero**: `id`, `owner_id`, `type` (`"sniper"`), `x`, `y`, `hp`, `cooldown`.
 - **Projectile**: `owner_id`, `type` (`"sniper"`), `origin_x`, `origin_y`, `x`, `y`, `ttl`.
 - **Wall**: `x`, `y` (center on the valid hero grid).
-
 

@@ -213,6 +213,7 @@ dependencies = [
  "anyhow",
  "futures",
  "futures-util",
+ "rand",
  "rustls",
  "serde",
  "serde_json",
