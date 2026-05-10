@@ -394,6 +394,8 @@ where
 // MAIN
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub const VERSUS_PLAYERS: bool = false;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let url = "wss://bitdefenders.cvjd.me/ws";
@@ -447,7 +449,11 @@ async fn main() -> anyhow::Result<()> {
                 })).await?;
             }
             "READY" => {
-                send_msg(&mut write, "PRACTICE", serde_json::json!({})).await?;
+                if VERSUS_PLAYERS {
+                    send_msg(&mut write, "CHALLENGE", serde_json::json!({})).await?;
+                } else {
+                    send_msg(&mut write, "PRACTICE", serde_json::json!({})).await?;
+                }
             }
             "START_MATCH" => {
                 let args: StartMatchArgs = serde_json::from_value(msg.args)
@@ -471,6 +477,11 @@ async fn main() -> anyhow::Result<()> {
                     .and_then(|p| p.heroes.first())
                     .map(|h| h.x)
                     .unwrap_or(map_w / 2);
+                let my_spawn_y = args.config.players.iter()
+                    .find(|p| p.id == my_player_id)
+                    .and_then(|p| p.heroes.first())
+                    .map(|h| h.y)
+                    .unwrap_or(0);
                 let enemy_spawn_x = args.config.players.iter()
                     .find(|p| p.id != my_player_id)
                     .and_then(|p| p.heroes.first())
@@ -478,8 +489,17 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or(map_w / 2);
                 // home = cea mai apropiata pozitie libera de la varful hartii
                 // away = cea mai apropiata pozitie libera de la fundul hartii
-                let (hx, hy) = find_top_target(my_spawn_x, map_h, &map_walls, map_w);
-                let (ax, ay) = find_bottom_target(enemy_spawn_x, map_h, &map_walls, map_w);
+                let we_are_at_bottom = my_spawn_y > map_h / 2;
+                let (hx, hy) = if we_are_at_bottom {
+                    find_bottom_target(my_spawn_x, map_h, &map_walls, map_w)
+                } else {
+                    find_top_target(my_spawn_x, map_h, &map_walls, map_w)
+                };
+                let (ax, ay) = if we_are_at_bottom {
+                    find_top_target(enemy_spawn_x, map_h, &map_walls, map_w)
+                } else {
+                    find_bottom_target(enemy_spawn_x, map_h, &map_walls, map_w)
+                };
                 home_x = hx; home_y = hy;
                 away_x = ax; away_y = ay;
                 target_x = away_x;
