@@ -290,7 +290,6 @@ async fn process_turn<S>(
     my_player_id: i32,
     config: &GameConfig,
     map_walls: &[Wall],   
-    enemy_spotted: &mut bool,
     target_x: &mut i32,
     target_y: &mut i32,
     home_x: i32,
@@ -314,10 +313,6 @@ where
         .filter(|h| h.owner_id != my_player_id)
         .collect();
 
-    if !enemy_heroes.is_empty() {
-        *enemy_spotted = true;
-    }
-
     // Colectam toate mesajele turei si le trimitem odata cu send_all
     let mut messages: Vec<Message> = Vec::new();
 
@@ -336,7 +331,8 @@ where
         // tragem daca se poate
         if hero.cooldown == 0 && !enemy_heroes.is_empty() {
             let target = enemy_heroes.iter().find(|enemy| {
-                has_line_of_sight(hero.x, hero.y, enemy.x, enemy.y, map_walls)
+                enemy.cooldown == 1
+                    && has_line_of_sight(hero.x, hero.y, enemy.x, enemy.y, map_walls)
             });
 
             if let Some(enemy) = target {
@@ -354,16 +350,12 @@ where
             }
         }
 
-        let (move_x, move_y) = if !*enemy_spotted {
-            (hero.x, hero.y)
-        } else {
-            bfs_next_step(
-                hero.x, hero.y,
-                *target_x, *target_y,
-                map_walls,
-                map_w, map_h,
-            )
-        };
+        let (move_x, move_y) = bfs_next_step(
+            hero.x, hero.y,
+            *target_x, *target_y,
+            map_walls,
+            map_w, map_h,
+        );
 
         let comment = if move_x == hero.x && move_y == hero.y {
             "😴"
@@ -393,7 +385,6 @@ where
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────────────────────
-
 pub const VERSUS_PLAYERS: bool = false;
 
 #[tokio::main]
@@ -408,8 +399,6 @@ async fn main() -> anyhow::Result<()> {
     let mut config: Option<GameConfig> = None;
     let mut my_player_id: i32 = 0;
 
-    // Latch pe durata meciului: devine true când apare primul inamic vizibil (în START_TURN).
-    let mut enemy_spotted: bool = false;
     let mut target_x: i32 = 0;
     let mut target_y: i32 = 0;
     let mut home_x: i32 = 0;
@@ -452,7 +441,9 @@ async fn main() -> anyhow::Result<()> {
                 if VERSUS_PLAYERS {
                     send_msg(&mut write, "CHALLENGE", serde_json::json!({})).await?;
                 } else {
-                    send_msg(&mut write, "PRACTICE", serde_json::json!({})).await?;
+                    send_msg(&mut write, "PRACTICE", serde_json::json!({
+                        "my_id": 1
+                    })).await?;
                 }
             }
             "START_MATCH" => {
@@ -508,8 +499,6 @@ async fn main() -> anyhow::Result<()> {
 
                 config = Some(args.config);
 
-                // Reset latch-ul la inceput de meci.
-                enemy_spotted = false;
             }
             "START_TURN" => {
                 let args: StartTurnArgs = serde_json::from_value(msg.args)
@@ -521,7 +510,6 @@ async fn main() -> anyhow::Result<()> {
                         my_player_id,
                         cfg,
                         &map_walls,
-                        &mut enemy_spotted,
                         &mut target_x,
                         &mut target_y,
                         home_x,
